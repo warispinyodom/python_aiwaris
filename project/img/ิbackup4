@@ -1,0 +1,132 @@
+import cv2
+import tkinter as tk
+from PIL import Image, ImageTk
+import numpy as np
+from ultralytics import YOLO
+import mysql.connector
+import face_recognition
+
+app = tk.Tk()
+app.title("Face Check")
+
+# Load YOLO model
+model = YOLO('yolov8n.pt')
+cap = cv2.VideoCapture(0)
+if not cap.isOpened():
+    print("Error: Cannot open camera.")
+    exit()
+
+# Initialize counting system
+count = 0
+count_label = tk.Label(app, text=f"Count: {count}", font=("Arial", 20))
+count_label.pack()
+
+# Sensor position (in the center of the frame)
+sensor_x = 320  # Sensor X position in the middle of a 640x480 video frame
+
+# Buffer zone to detect crossing
+buffer_zone = 20
+
+# Track object states
+crossed = {}  # Dictionary to keep track of object crossing status
+
+def load_face_data():
+    conn = mysql.connector.connect(
+        host="localhost",
+        user="root",
+        password="",
+        database="member"
+    )
+    cursor = conn.cursor()
+    cursor.execute("SELECT username, picture FROM users")
+    face_data_db = cursor.fetchall()
+    
+    known_face_encodings = []
+    known_face_names = []
+    
+    for username, face_data in face_data_db:
+        expected_size = 128 * 8  # 128 float64 values, each 8 bytes
+        if len(face_data) == expected_size:
+            face_encoding = np.frombuffer(face_data, dtype=np.float64)
+            known_face_encodings.append(face_encoding)
+            known_face_names.append(username)
+        else:
+            print(f"Error: Invalid face encoding size for {username}. Expected size {expected_size}, but got {len(face_data)}.")
+    
+    cursor.close()
+    conn.close()
+    
+    return known_face_encodings, known_face_names
+
+known_face_encodings, known_face_names = load_face_data()
+
+def detect_person():
+    global count, crossed
+    check, frame = cap.read()
+    if check:
+        # Detect objects using YOLO
+        results = model(frame, conf=0.7)
+        
+        # Extract bounding boxes and class IDs
+        boxes = results[0].boxes
+        
+        new_crossed = set()  # Set to track current frame crossings
+        
+        for box in boxes:
+            x_min, y_min, x_max, y_max = map(int, box.xyxy[0].tolist())
+            class_id = int(box.cls[0])
+            if class_id == 0:  # Assuming class_id 0 corresponds to 'person'
+                # Draw bounding box
+                cv2.rectangle(frame, (x_min, y_min), (x_max, y_max), (0, 255, 0), 2)
+                
+                # Calculate the center of the bounding box
+                center_x = (x_min + x_max) // 2
+                center_y = (y_min + y_max) // 2
+                box_coords = (x_min, y_min, x_max, y_max)
+                
+                # Check if person has crossed the sensor point
+                if box_coords not in crossed:
+                    if abs(center_x - sensor_x) < buffer_zone:
+                        # Person is close to the sensor
+                        crossed[box_coords] = 'detected'
+                        count += 1
+                        count_label.config(text=f"Count: {count}")
+                
+                # Extract face region and recognize face
+                face_image = frame[y_min:y_max, x_min:x_max]
+                if face_image.size > 0:
+                    rgb_face_image = cv2.cvtColor(face_image, cv2.COLOR_BGR2RGB)
+                    face_encodings = face_recognition.face_encodings(rgb_face_image)
+                    if face_encodings:
+                        face_encoding = face_encodings[0]
+                        matches = face_recognition.compare_faces(known_face_encodings, face_encoding)
+                        distances = face_recognition.face_distance(known_face_encodings, face_encoding)
+                        best_match_index = np.argmin(distances)
+                        if matches[best_match_index]:
+                            detected_name = known_face_names[best_match_index]
+                            cv2.putText(frame, detected_name, (x_min, y_min - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.9, (255, 0, 0), 2)
+        
+        # Draw sensor point
+        cv2.circle(frame, (sensor_x, 240), 10, (0, 255, 0), -1)  # Draw a circle at sensor position
+        cv2.putText(frame, 'Sensor', (sensor_x + 20, 240), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 2, cv2.LINE_AA)
+        
+        # Convert frame to PIL Image and display in Tkinter
+        img = Image.fromarray(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
+        imgtk = ImageTk.PhotoImage(image=img)
+        label_video.imgtk = imgtk
+        label_video.config(image=imgtk)
+    
+    app.after(10, detect_person)
+
+# Display video feed
+label_video = tk.Label(app)
+label_video.pack()
+
+# Start detection
+detect_person()
+
+# GUI loop
+app.mainloop()
+
+# Release camera when program closes
+cap.release()

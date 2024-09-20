@@ -1,0 +1,152 @@
+import cv2
+import tkinter as tk
+from PIL import Image, ImageTk
+import numpy as np
+from ultralytics import YOLO
+import mysql.connector
+import face_recognition
+
+app = tk.Tk()
+app.title("Face Check")
+
+model = YOLO('yolov8n.pt')
+cap = cv2.VideoCapture(0)
+if not cap.isOpened():
+    print("Error: Cannot open camera.")
+    exit()
+
+# Initialize counting system
+count = 0
+count_label = tk.Label(app, text=f"Count: {count}", font=("Arial", 20))
+count_label.pack()
+
+# Line position
+line_x = 320  # Vertical line in the middle of a 640x480 video frame
+
+# Buffer zone to detect crossing
+buffer_zone = 20
+
+# Track object states
+crossed = set()  # Set to keep track of objects that have crossed the line
+crossing_detected = set()  # Set to detect new crossings
+
+def load_face_data():
+    conn = mysql.connector.connect(
+        host="localhost",
+        user="root",
+        password="",
+        database="member"
+    )
+    cursor = conn.cursor()
+    cursor.execute("SELECT username, picture FROM users")
+    face_data_db = cursor.fetchall()  # [(username, face_encoding), ...]
+    
+    known_face_encodings = []
+    known_face_names = []
+    
+    for username, face_data in face_data_db:
+        expected_size = 128 * 8  # 128 float64 values, each 8 bytes
+        
+        if len(face_data) == expected_size:
+            face_encoding = np.frombuffer(face_data, dtype=np.float64)
+            known_face_encodings.append(face_encoding)
+            known_face_names.append(username)
+        else:
+            print(f"Error: Invalid face encoding size for {username}. Expected size {expected_size}, but got {len(face_data)}.")
+    
+    cursor.close()
+    conn.close()
+    
+    return known_face_encodings, known_face_names
+
+known_face_encodings, known_face_names = load_face_data()
+
+def detect_person():
+    global count, crossed
+    check, frame = cap.read()
+    if check:
+        # Detect objects using YOLO
+        results = model(frame)
+        
+        # Print results to debug
+        print("YOLO Results:", results)
+        print("Results type:", type(results))
+        print("Boxes:", results[0].boxes.xyxy)  # Print the bounding boxes
+        
+        # Extract bounding boxes and class IDs
+        boxes = results[0].boxes
+        current_boxes = set()  # Set to store bounding boxes of the current frame
+        new_crossings = set()  # Track new crossings for this frame
+        
+        for box in boxes:
+            x_min, y_min, x_max, y_max = map(int, box.xyxy[0].tolist())
+            class_id = int(box.cls[0])
+            if class_id == 0:  # Assuming class_id 0 corresponds to 'person'
+                # Draw bounding box
+                cv2.rectangle(frame, (x_min, y_min), (x_max, y_max), (0, 255, 0), 2)
+                
+                # Determine if person crosses the line
+                center_x = (x_min + x_max) // 2
+                box_coords = (x_min, y_min, x_max, y_max)
+                
+                # Check if the bounding box crosses the line
+                if center_x < line_x - buffer_zone and (box_coords not in crossed):
+                    # Person is to the left of the line
+                    crossed.add(box_coords)
+                elif center_x > line_x + buffer_zone and (box_coords not in crossed):
+                    # Person is to the right of the line
+                    crossed.add(box_coords)
+                
+                # Detect new crossing events
+                if (box_coords not in crossing_detected) and (center_x >= line_x - buffer_zone and center_x <= line_x + buffer_zone):
+                    if box_coords in crossed:
+                        if center_x < line_x:
+                            # Person is crossing from left to right
+                            count += 1
+                        elif center_x > line_x:
+                            # Person is crossing from right to left
+                            if count > 0:
+                                count -= 1
+                        count_label.config(text=f"Count: {count}")
+                        crossing_detected.add(box_coords)
+                
+                # Extract face region and recognize face
+                face_image = frame[y_min:y_max, x_min:x_max]
+                if face_image.size > 0:  # Check if face_image is not empty
+                    rgb_face_image = cv2.cvtColor(face_image, cv2.COLOR_BGR2RGB)
+                    face_encodings = face_recognition.face_encodings(rgb_face_image)
+                    if face_encodings:
+                        face_encoding = face_encodings[0]
+                        matches = face_recognition.compare_faces(known_face_encodings, face_encoding)
+                        distances = face_recognition.face_distance(known_face_encodings, face_encoding)
+                        best_match_index = np.argmin(distances)
+                        if matches[best_match_index]:
+                            detected_name = known_face_names[best_match_index]
+                            cv2.putText(frame, detected_name, (x_min, y_min - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.9, (255, 0, 0), 2)
+        
+        # Reset crossing_detected for the next frame
+        crossing_detected.clear()
+        
+        # Draw vertical line in the middle
+        cv2.line(frame, (line_x, 0), (line_x, frame.shape[0]), (255, 0, 0), 2)
+        
+        # Convert frame to PIL Image and display in Tkinter
+        img = Image.fromarray(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
+        imgtk = ImageTk.PhotoImage(image=img)
+        label_video.imgtk = imgtk
+        label_video.config(image=imgtk)
+    
+    app.after(10, detect_person)
+
+# Display video feed
+label_video = tk.Label(app)
+label_video.pack()
+
+# Start detection
+detect_person()
+
+# GUI loop
+app.mainloop()
+
+# Release camera when program closes
+cap.release()

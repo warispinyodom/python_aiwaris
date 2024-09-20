@@ -1,0 +1,167 @@
+import cv2
+import tkinter as tk
+from PIL import Image, ImageTk
+import numpy as np
+from ultralytics import YOLO
+import mysql.connector
+import face_recognition
+
+app = tk.Tk()
+app.title("Face Check")
+
+# Load YOLO model
+model = YOLO('yolov8n.pt')
+cap = cv2.VideoCapture(0)
+if not cap.isOpened():
+    print("Error: Cannot open camera.")
+    exit()
+
+# Initialize counting system
+count = 0
+count_label = tk.Label(app, text=f"Count: {count}", font=("Arial", 20))
+count_label.pack()
+
+# Sensor line position
+line_x = 320  # Line X position in the middle of a 640x480 video frame
+buffer_zone = 20  # Buffer zone to detect crossing
+
+# Track object states
+trackers = []  # List to hold trackers
+object_states = {}  # Dictionary to keep track of the state of each object
+crossed_objects = set()  # Set to track objects that have crossed the line
+
+def load_face_data():
+    conn = mysql.connector.connect(
+        host="localhost",
+        user="root",
+        password="",
+        database="member"
+    )
+    cursor = conn.cursor()
+    cursor.execute("SELECT username, picture FROM users")
+    face_data_db = cursor.fetchall()
+    
+    known_face_encodings = []
+    known_face_names = []
+    
+    for username, face_data in face_data_db:
+        expected_size = 128 * 8  # 128 float64 values, each 8 bytes
+        if len(face_data) == expected_size:
+            face_encoding = np.frombuffer(face_data, dtype=np.float64)
+            known_face_encodings.append(face_encoding)
+            known_face_names.append(username)
+        else:
+            print(f"Error: Invalid face encoding size for {username}. Expected size {expected_size}, but got {len(face_data)}.")
+    
+    cursor.close()
+    conn.close()
+    
+    return known_face_encodings, known_face_names
+
+known_face_encodings, known_face_names = load_face_data()
+
+def detect_person():
+    global count, trackers, object_states, crossed_objects
+    
+    check, frame = cap.read()
+    if check:
+        # Detect objects using YOLO
+        results = model(frame, conf=0.7)  # Increase confidence threshold if needed
+        
+        # Extract bounding boxes and class IDs
+        boxes = results[0].boxes
+        
+        # Create new trackers for detected boxes
+        new_trackers = []
+        for box in boxes:
+            x_min, y_min, x_max, y_max = map(int, box.xyxy[0].tolist())
+            class_id = int(box.cls[0])
+            if class_id == 0:  # Assuming class_id 0 corresponds to 'person'
+                bbox = (x_min, y_min, x_max - x_min, y_max - y_min)
+                new_tracker = cv2.TrackerCSRT_create()
+                new_tracker.init(frame, bbox)
+                new_trackers.append((new_tracker, bbox))
+        
+        # Update the trackers and process the results
+        updated_trackers = []
+        for tracker, bbox in new_trackers:
+            success, bbox = tracker.update(frame)
+            if success:
+                x, y, w, h = map(int, bbox)
+                center_x = x + w // 2
+                object_id = id(tracker)  # Use tracker ID as a unique object ID
+                
+                # Track the object state
+                if object_id not in object_states:
+                    object_states[object_id] = {'state': 'not_crossed', 'last_center_x': center_x}
+                
+                state_info = object_states[object_id]
+                state = state_info['state']
+                last_center_x = state_info['last_center_x']
+                
+                # Check if object crossed the line
+                if center_x < line_x - buffer_zone and state == 'not_crossed' and last_center_x >= line_x:
+                    if object_id not in crossed_objects:
+                        # Person is moving left and has not been counted before
+                        count -= 1
+                        if count < 0:  # Ensure count does not go negative
+                            count = 0
+                        count_label.config(text=f"Count: {count}")
+                        object_states[object_id] = {'state': 'crossed_left', 'last_center_x': center_x}
+                        crossed_objects.add(object_id)
+                elif center_x > line_x + buffer_zone and state == 'not_crossed' and last_center_x <= line_x:
+                    if object_id not in crossed_objects:
+                        # Person is moving right and has not been counted before
+                        count += 1
+                        count_label.config(text=f"Count: {count}")
+                        object_states[object_id] = {'state': 'crossed_right', 'last_center_x': center_x}
+                        crossed_objects.add(object_id)
+                else:
+                    object_states[object_id] = {'state': state, 'last_center_x': center_x}
+                
+                # Draw bounding box
+                cv2.rectangle(frame, (x, y), (x + w, y + h), (0, 255, 0), 2)
+                
+                # Extract face region and recognize face
+                face_image = frame[y:y + h, x:x + w]
+                if face_image.size > 0:
+                    rgb_face_image = cv2.cvtColor(face_image, cv2.COLOR_BGR2RGB)
+                    face_encodings = face_recognition.face_encodings(rgb_face_image)
+                    if face_encodings:
+                        face_encoding = face_encodings[0]
+                        matches = face_recognition.compare_faces(known_face_encodings, face_encoding)
+                        distances = face_recognition.face_distance(known_face_encodings, face_encoding)
+                        best_match_index = np.argmin(distances)
+                        if matches[best_match_index]:
+                            detected_name = known_face_names[best_match_index]
+                            cv2.putText(frame, detected_name, (x, y - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.9, (255, 0, 0), 2)
+                
+                updated_trackers.append((tracker, bbox))
+        
+        # Update the list of trackers
+        trackers = updated_trackers
+        
+        # Draw sensor line
+        cv2.line(frame, (line_x, 0), (line_x, frame.shape[0]), (0, 255, 0), 2)
+        cv2.putText(frame, 'Sensor Line', (line_x + 10, 30), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 2, cv2.LINE_AA)
+        
+        # Convert frame to PIL Image and display in Tkinter
+        img = Image.fromarray(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
+        imgtk = ImageTk.PhotoImage(image=img)
+        label_video.imgtk = imgtk
+        label_video.config(image=imgtk)
+    
+    app.after(10, detect_person)
+
+# Display video feed
+label_video = tk.Label(app)
+label_video.pack()
+
+# Start detection
+detect_person()
+
+# GUI loop
+app.mainloop()
+
+# Release camera when program closes
+cap.release()
